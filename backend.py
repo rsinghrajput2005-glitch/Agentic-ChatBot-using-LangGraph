@@ -19,16 +19,16 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 
 
 load_dotenv()
 
 llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
 
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+# Hosted embeddings: no torch / local model, so startup is fast and RAM usage is low.
+# Needs GOOGLE_API_KEY in your .env (free key from https://aistudio.google.com/apikey)
+embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(BASE_DIR, "faiss_db")
