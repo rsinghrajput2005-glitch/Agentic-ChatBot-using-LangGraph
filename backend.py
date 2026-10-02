@@ -1,5 +1,9 @@
 import os
+import re
 import math
+import hmac
+import hashlib
+import secrets
 import sqlite3
 from typing import Any, TypedDict, Annotated
 
@@ -8,6 +12,7 @@ from dotenv import load_dotenv
 
 from langchain_core.messages import BaseMessage, SystemMessage
 from langchain_core.tools import tool
+from langchain_core.runnables import RunnableConfig
 from langchain_groq import ChatGroq
 from langchain_tavily import TavilySearch
 
@@ -31,26 +36,37 @@ llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "faiss_db")
+FAISS_ROOT = os.path.join(BASE_DIR, "faiss_db")
+USERS_DB_PATH = os.path.join(BASE_DIR, "users.db")
 CHAT_DB_PATH = os.path.join(BASE_DIR, "chatbot.db")
 
 
-def ingest_rag_document(file_path: str) -> int:
-    """Index a PDF into FAISS (replaces the previous index). Returns chunk count."""
+def user_index_path(user_id: str) -> str:
+    """Each user gets a private FAISS index folder."""
+    return os.path.join(FAISS_ROOT, user_id)
+
+
+def has_pdf(user_id: str) -> bool:
+    return os.path.exists(user_index_path(user_id))
+
+
+def ingest_rag_document(file_path: str, user_id: str) -> int:
+    """Index a PDF into this user's private FAISS index (replaces their previous one)."""
     loader = PyPDFLoader(file_path)
     docs = loader.load()
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = splitter.split_documents(docs)
     vector_store = FAISS.from_documents(chunks, embeddings)
-    vector_store.save_local(DB_PATH)
+    vector_store.save_local(user_index_path(user_id))
     return len(chunks)
 
 
-def get_retriever():
-    if not os.path.exists(DB_PATH):
+def get_retriever(user_id: str):
+    path = user_index_path(user_id)
+    if not os.path.exists(path):
         return None
     vector_store = FAISS.load_local(
-        folder_path=DB_PATH,
+        folder_path=path,
         embeddings=embeddings,
         allow_dangerous_deserialization=True,
     )
@@ -58,7 +74,7 @@ def get_retriever():
 
 
 @tool
-def rag_tool(query: str) -> str:
+def rag_tool(query: str, config: RunnableConfig) -> str:
     """
     Retrieve relevant information from the PDF document.
 
@@ -68,8 +84,12 @@ def rag_tool(query: str) -> str:
     Args:
         query: The question or search query used to retrieve PDF content.
     """
-    # Load lazily so a newly uploaded PDF is picked up without restarting
-    retriever = get_retriever()
+    # Only ever search the PDF belonging to the user who is chatting
+    user_id = (config or {}).get("configurable", {}).get("user_id")
+    if not user_id:
+        return "No PDF document is currently available."
+
+    retriever = get_retriever(user_id)
 
     if retriever is None:
         return "No PDF document is currently available."
@@ -240,10 +260,11 @@ SYSTEM_PROMPT = (
 )
 
 
-def chat_node(state: ChatState):
+def chat_node(state: ChatState, config: RunnableConfig):
+    user_id = (config or {}).get("configurable", {}).get("user_id")
     pdf_status = (
         "\n\nStatus: a PDF is currently indexed and available through `rag_tool`."
-        if os.path.exists(DB_PATH)
+        if user_id and has_pdf(user_id)
         else "\n\nStatus: no PDF has been indexed yet."
     )
     messages = [SystemMessage(content=SYSTEM_PROMPT + pdf_status), *state["messages"]]
@@ -264,12 +285,13 @@ checkpoint = SqliteSaver(conn)
 chatbot = graph.compile(checkpointer=checkpoint)
 
 
-def retrieve_all_threads() -> list[str]:
-    """Thread ids ordered oldest -> newest."""
+def retrieve_all_threads(user_id: str) -> list[str]:
+    """Thread ids belonging to this user only, ordered oldest -> newest."""
+    prefix = f"{user_id}__"
     seen = []
     for cp in checkpoint.list(None):  # newest checkpoint first
         tid = cp.config["configurable"]["thread_id"]
-        if tid not in seen:
+        if tid.startswith(prefix) and tid not in seen:
             seen.append(tid)
     return seen[::-1]
 
@@ -286,3 +308,49 @@ def delete_thread(thread_id: str) -> None:
             cur.execute("DELETE FROM writes WHERE thread_id = ?", (thread_id,))
             conn.commit()
             cur.close()
+
+
+# ---------------- simple user accounts ----------------
+users_conn = sqlite3.connect(USERS_DB_PATH, check_same_thread=False)
+users_conn.execute(
+    "CREATE TABLE IF NOT EXISTS users ("
+    "username TEXT PRIMARY KEY, salt BLOB NOT NULL, pw_hash BLOB NOT NULL)"
+)
+users_conn.commit()
+
+
+def _hash_password(password: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 200_000)
+
+
+def create_user(username: str, password: str) -> tuple[bool, str]:
+    """Returns (ok, username_or_error_message)."""
+    username = username.strip().lower()
+    if not re.fullmatch(r"[a-z0-9]{3,20}", username):
+        return False, "Username must be 3-20 letters or numbers (no spaces or symbols)."
+    if len(password) < 6:
+        return False, "Password must be at least 6 characters."
+    salt = secrets.token_bytes(16)
+    try:
+        users_conn.execute(
+            "INSERT INTO users (username, salt, pw_hash) VALUES (?, ?, ?)",
+            (username, salt, _hash_password(password, salt)),
+        )
+        users_conn.commit()
+    except sqlite3.IntegrityError:
+        return False, "That username is already taken."
+    return True, username
+
+
+def verify_user(username: str, password: str) -> str | None:
+    """Returns the normalized username if the credentials are correct, else None."""
+    username = username.strip().lower()
+    row = users_conn.execute(
+        "SELECT salt, pw_hash FROM users WHERE username = ?", (username,)
+    ).fetchone()
+    if row is None:
+        return None
+    salt, stored = row
+    if hmac.compare_digest(_hash_password(password, salt), stored):
+        return username
+    return None

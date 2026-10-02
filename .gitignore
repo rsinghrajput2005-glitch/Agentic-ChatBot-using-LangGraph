@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+
+users.db*
+chatbot.db*
+faiss_db/
 # C extensions
 *.so
 

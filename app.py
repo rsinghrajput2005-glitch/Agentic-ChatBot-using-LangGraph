@@ -10,7 +10,9 @@ from backend import (
     ingest_rag_document,
     retrieve_all_threads,
     delete_thread,
-    DB_PATH,
+    has_pdf,
+    create_user,
+    verify_user,
 )
 
 st.set_page_config(page_title="Agentic Chatbot", page_icon="🤖", layout="wide")
@@ -21,6 +23,47 @@ TOOL_LABELS = {
     "calculator": "🧮 Calculating",
     "get_current_weather": "⛅ Fetching weather",
 }
+
+
+# ---------- login gate ----------
+def auth_screen():
+    st.title("🤖 Agentic Chatbot")
+    st.caption("Log in to see your own chats and PDFs. Other users can't see them.")
+
+    tab_login, tab_signup = st.tabs(["Log in", "Sign up"])
+
+    with tab_login:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Log in", use_container_width=True)
+        if submitted:
+            user = verify_user(username, password)
+            if user:
+                st.session_state.user = user
+                st.rerun()
+            else:
+                st.error("Wrong username or password.")
+
+    with tab_signup:
+        with st.form("signup_form"):
+            new_user = st.text_input("Choose a username")
+            new_pass = st.text_input("Choose a password", type="password")
+            created = st.form_submit_button("Create account", use_container_width=True)
+        if created:
+            ok, result = create_user(new_user, new_pass)
+            if ok:
+                st.session_state.user = result
+                st.rerun()
+            else:
+                st.error(result)
+
+
+if "user" not in st.session_state:
+    auth_screen()
+    st.stop()
+
+USER = st.session_state.user
 
 
 # ---------- helpers ----------
@@ -48,7 +91,7 @@ def thread_title(thread_id: str) -> str:
 
 
 def new_chat():
-    tid = str(uuid.uuid4())
+    tid = f"{USER}__{uuid.uuid4()}"
     st.session_state.thread_id = tid
     st.session_state.history = []
     if tid not in st.session_state.threads:
@@ -78,21 +121,27 @@ def remove_all_chats():
     new_chat()
 
 
+def logout():
+    st.session_state.clear()
+    st.query_params.clear()
+
+
 # ---------- session state ----------
 if "indexed_file" not in st.session_state:
     st.session_state.indexed_file = None
 if "history" not in st.session_state:
     st.session_state.history = []
 if "threads" not in st.session_state:
-    st.session_state.threads = retrieve_all_threads()
+    st.session_state.threads = retrieve_all_threads(USER)
 
 if "thread_id" not in st.session_state:
     saved_id = st.query_params.get("thread_id")
-    if saved_id:  # page refresh: URL keeps the thread
+    # Only accept a thread from the URL if it belongs to the logged-in user
+    if saved_id and saved_id.startswith(f"{USER}__"):
         if saved_id not in st.session_state.threads:
             st.session_state.threads.append(saved_id)
         open_chat(saved_id)
-    elif st.session_state.threads:  # fresh start: resume latest chat
+    elif st.session_state.threads:
         open_chat(st.session_state.threads[-1])
     else:
         new_chat()
@@ -104,7 +153,12 @@ st.query_params["thread_id"] = st.session_state.thread_id
 # ---------- sidebar ----------
 with st.sidebar:
     st.title("🤖 Agentic Chatbot")
+    st.caption(f"👤 Logged in as **{USER}**")
+    if st.button("Log out", use_container_width=True):
+        logout()
+        st.rerun()
 
+    st.divider()
     if st.button("➕ New chat", use_container_width=True):
         new_chat()
         st.rerun()
@@ -119,15 +173,15 @@ with st.sidebar:
                 tmp.write(uploaded.getbuffer())
                 tmp_path = tmp.name
             try:
-                n_chunks = ingest_rag_document(tmp_path)
+                n_chunks = ingest_rag_document(tmp_path, USER)
                 st.session_state.indexed_file = uploaded.name
                 st.success(f"Indexed {uploaded.name} ({n_chunks} chunks)")
             finally:
                 os.remove(tmp_path)
     elif st.session_state.indexed_file:
         st.caption(f"Active: {st.session_state.indexed_file}")
-    elif os.path.exists(DB_PATH):
-        st.caption("Using previously indexed PDF")
+    elif has_pdf(USER):
+        st.caption("Using your previously indexed PDF")
     else:
         st.caption("No PDF indexed yet")
 
@@ -152,7 +206,7 @@ with st.sidebar:
 
     if st.session_state.threads:
         with st.expander("⚠️ Danger zone"):
-            confirm = st.checkbox("I want to delete ALL chats")
+            confirm = st.checkbox("I want to delete ALL my chats")
             if st.button("Delete all chats", disabled=not confirm):
                 remove_all_chats()
                 st.rerun()
@@ -172,7 +226,12 @@ if user_input:
     with st.chat_message("user"):
         st.markdown(user_input)
 
-    config = {"configurable": {"thread_id": st.session_state.thread_id}}
+    config = {
+        "configurable": {
+            "thread_id": st.session_state.thread_id,
+            "user_id": USER,
+        }
+    }
 
     with st.chat_message("assistant"):
         tool_status = st.empty()
