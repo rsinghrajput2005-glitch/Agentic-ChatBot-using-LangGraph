@@ -54,7 +54,7 @@ def get_retriever():
         embeddings=embeddings,
         allow_dangerous_deserialization=True,
     )
-    return vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 3})
+    return vector_store.as_retriever(search_type="similarity", search_kwargs={"k": 6})
 
 
 @tool
@@ -221,22 +221,32 @@ class ChatState(TypedDict):
 SYSTEM_PROMPT = (
     "You are a helpful Agentic Chatbot with access to several tools.\n\n"
     "Tool usage instructions:\n"
-    "- Use `rag_tool` for questions about the uploaded PDF or document. "
-    "Always retrieve relevant document content before answering PDF-related questions.\n"
+    "- Use `rag_tool` for ANY question about the PDF or document: summaries, "
+    "'first question', explanations, solutions, page content, and so on. "
+    "You cannot see the PDF yourself, so you MUST call `rag_tool` first. "
+    "Never say that no PDF is available unless `rag_tool` itself returns that. "
+    "For broad requests like a summary, call `rag_tool` several times with different "
+    "queries (e.g. 'introduction', 'main topics', 'conclusion', 'questions') before answering. "
+    "For a specific question number, search for that wording (e.g. 'Question 1', 'Q1').\n"
     "- Use `search_tool` for current events, recent information, or information "
     "that requires an internet search.\n"
     "- Use `calculator` for mathematical calculations. Do not calculate complex "
     "expressions manually when the calculator is available.\n"
     "- Use `get_current_weather` when the user asks about current weather for a location.\n\n"
     "Answer general questions directly when no tool is required. "
-    "Do not invent information from the uploaded document. "
-    "If the user asks about a PDF but no document is available, ask them to upload a PDF. "
+    "Do not invent information from the document; base PDF answers only on what "
+    "`rag_tool` returns. If `rag_tool` says no PDF is available, then ask the user to upload one. "
     "After receiving a tool result, provide a clear and helpful final answer."
 )
 
 
 def chat_node(state: ChatState):
-    messages = [SystemMessage(content=SYSTEM_PROMPT), *state["messages"]]
+    pdf_status = (
+        "\n\nStatus: a PDF is currently indexed and available through `rag_tool`."
+        if os.path.exists(DB_PATH)
+        else "\n\nStatus: no PDF has been indexed yet."
+    )
+    messages = [SystemMessage(content=SYSTEM_PROMPT + pdf_status), *state["messages"]]
     response = tool_llm.invoke(messages)
     return {"messages": [response]}
 
